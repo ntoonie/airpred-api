@@ -1,0 +1,61 @@
+# AIRPRED experiment configuration.
+# Only values the thesis explicitly states are filled in below.
+# Every "TODO" must be resolved (see implementation guide Section 34)
+# before this config is treated as final.
+
+data:
+  cities: [Manila, Quezon_City, Caloocan, Valenzuela, Pasig, Makati,
+           Mandaluyong, Navotas, Pasay, San_Juan]
+  date_start: "2022-08-01"
+  date_end: "2024-12-31"
+  input_window: 48
+  forecast_horizon: 24
+  stride: 1
+  train_ratio: 0.70
+  val_ratio: 0.10
+  test_ratio: 0.20
+  split_method: "global_chronological_cutoff"   # ASSUMPTION -- see guide Section 13
+  max_interpolation_gap_hours: 3
+  pm25_implausible_threshold: 500   # µg/m3
+  pm25_derivation_formula: "nasa_gmao"   # RESOLVED -- see guide Section 7 and chat findings (SO4SMASS confirmed)
+
+model:
+  tcn_blocks: 4
+  dilations: [1, 2, 4, 8]
+  tcn_channels: [64, 64, 128, 128]
+  kernel_size: 3
+  d_model: 128               # TODO — NOT SPECIFIED IN THESIS, guide Section 16
+  num_attention_heads: 4
+  fused_dim: 256
+  forecast_head_hidden: 128
+  forecast_head_dropout: 0.1
+  tcn_block_dropout: 0.0     # TODO — NOT SPECIFIED IN THESIS, guide Section 17
+
+training:
+  optimizer: adam
+  learning_rate: 1.0e-3
+  batch_size: 64
+  max_epochs: 100
+  early_stopping_patience: 10
+  early_stopping_metric: val_rmse
+  loss: mse
+  weight_decay: 0.0           # TODO — NOT SPECIFIED IN THESIS
+  random_seed: 42             # TODO — NOT SPECIFIED IN THESIS, pick and document
+  device: cuda                # overridden automatically by train_local.py / the Colab notebooks based on actual GPU availability
+
+evaluation:
+  metrics: [rmse, mae, mape, r2]
+  mape_zero_exclusion: true
+  alpha: 0.05
+
+statistical_tests:
+  H1: {proposed: C, baseline: A}   # the literal Chapter 1 hypothesis -- AIRPRED vs
+                                     # single-branch unified encoding + concat fusion.
+                                     # Distinct from RQ1-3's pairwise ablation chain --
+                                     # add this explicitly rather than inferring it from
+                                     # RQ1+RQ2 holding, since that's an assumption, not a test.
+  RQ1: {proposed: B, baseline: A}
+  RQ2: {proposed: C, baseline: B}
+  RQ3: {proposed: C, baseline: D}
+  test: paired_t_test
+  paired_unit: "per_window_rmse"   # ASSUMPTION — see guide Section 27ss
