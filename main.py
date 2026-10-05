@@ -3,7 +3,8 @@ from __future__ import annotations
 import csv
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from html import escape
 
 import joblib
 import numpy as np
@@ -12,6 +13,7 @@ import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 load_dotenv()
 
@@ -70,6 +72,28 @@ for _name in VARIANT_CLASSES:
     _model.eval()
     MODELS[_name] = _model
 print("Models loaded:", list(MODELS.keys()))
+
+# Models fine-tuned on OpenAQ ground-sensor data (finetune_openaq.py). Used ONLY by
+# /predict_live_openaq -- OpenAQ input is point-sensor PM2.5, which the original
+# MERRA-2-trained models under-predict. GEOS-CF and /predict keep the originals.
+# If a fine-tuned checkpoint is missing, that variant falls back to the original
+# weights and is reported as such, never silently.
+MODELS_OPENAQ = {}
+OPENAQ_MODEL_VERSION = {}
+for _name in VARIANT_CLASSES:
+    _ft_path = f"checkpoints/variant_{_name.lower()}_seed42_openaq_ft.pt"
+    if os.path.isfile(_ft_path):
+        _m = build_model(_name)
+        _m.load_state_dict(torch.load(_ft_path, map_location=DEVICE))
+        _m.eval()
+        MODELS_OPENAQ[_name] = _m
+        OPENAQ_MODEL_VERSION[_name] = "fine-tuned on OpenAQ"
+    else:
+        MODELS_OPENAQ[_name] = MODELS[_name]
+        OPENAQ_MODEL_VERSION[_name] = "original (MERRA-2 only; no fine-tuned checkpoint found)"
+print("OpenAQ-endpoint models:", OPENAQ_MODEL_VERSION)
+_ALL_FT = all(v == "fine-tuned on OpenAQ" for v in OPENAQ_MODEL_VERSION.values())
+OPENAQ_SOURCE_LABEL = "OpenAQ (ground sensor) [fine-tuned]" if _ALL_FT else "OpenAQ (ground sensor)"
 
 print("Loading scaler...")
 SCALER = joblib.load("scaler.pkl")
@@ -131,15 +155,20 @@ def health():
 
 
 @app.get("/prediction_log")
-def prediction_log(limit: int = 200):
+def prediction_log(limit: int = 200, source: str | None = None):
     """Newest-first rows from prediction_log.csv, with each variant's 24h
     forecast summarized (mean + peak) so the dashboard can show predicted vs
-    actual in a table. actual_* fields are null until log_actual.py fills
-    them in."""
+    actual in a table. actual_* fields are null until fill_actuals.py (or
+    log_actual.py) fills them in. Pass source=openaq to keep only the
+    OpenAQ rows (live and backfilled)."""
     if not os.path.isfile(PREDICTION_LOG_PATH):
         return {"rows": []}
     with open(PREDICTION_LOG_PATH, newline="") as f:
         rows = list(csv.DictReader(f))
+    if source:
+        rows = [r for r in rows if r["data_source"].lower().startswith(source.lower())]
+    # Newest prediction time first (backfilled rows are appended out of order).
+    rows.sort(key=lambda r: datetime.fromisoformat(r["logged_at_utc"]), reverse=True)
 
     def summarize(raw: str):
         try:
@@ -149,7 +178,7 @@ def prediction_log(limit: int = 200):
             return None
 
     out = []
-    for r in rows[-limit:][::-1]:
+    for r in rows[:limit]:
         actual = r.get("actual_pm25") or ""
         out.append({
             "logged_at_utc": r["logged_at_utc"],
@@ -166,6 +195,80 @@ def prediction_log(limit: int = 200):
             "actual_source": r.get("actual_source") or None,
         })
     return {"rows": out}
+
+
+PHT = timezone(timedelta(hours=8))  # Philippine time, for display only
+
+
+@app.get("/prediction_log/table", response_class=HTMLResponse)
+def prediction_log_table(limit: int = 300, source: str = "openaq"):
+    """Browser-friendly predicted-vs-actual table. OpenAQ rows only by
+    default; use ?source=all for every source, or ?limit=N to change length."""
+    rows = prediction_log(limit=limit, source=None if source.lower() == "all" else source)["rows"]
+
+    def fmt(v):
+        return f"{v:.1f}" if v is not None else "&mdash;"
+
+    errs = {v: [] for v in "ABCD"}
+    body = []
+    for r in rows:
+        actual = r["actual_pm25"]
+        means = {v: (r["variants"][v]["mean"] if r["variants"][v] else None) for v in "ABCD"}
+        for v in "ABCD":
+            if actual is not None and means[v] is not None:
+                errs[v].append(abs(actual - means[v]))
+        err_c = actual - means["C"] if actual is not None and means["C"] is not None else None
+        when = datetime.fromisoformat(r["logged_at_utc"]).astimezone(PHT).strftime("%Y-%m-%d %H:%M")
+        body.append(
+            "<tr>"
+            f"<td>{when}</td>"
+            f"<td>{escape(r['city'].replace('_', ' '))}</td>"
+            f"<td class='src'>{escape(r['data_source'])}</td>"
+            + "".join(f"<td class='n'>{fmt(means[v])}</td>" for v in "ABCD")
+            + f"<td class='n act' title=\"{escape(r['actual_source'] or '')}\">{fmt(actual)}</td>"
+            f"<td class='n'>{('%+.1f' % err_c) if err_c is not None else '&mdash;'}</td>"
+            "</tr>"
+        )
+
+    n_scored = len(errs["C"])
+    if n_scored:
+        mae = " &middot; ".join(
+            f"{v}{' (AIRPRED)' if v == 'C' else ''} {sum(errs[v]) / len(errs[v]):.2f}"
+            for v in "ABCD" if errs[v]
+        )
+        summary = f"MAE vs actual (n={n_scored}): {mae} &micro;g/m&sup3;"
+    else:
+        summary = "No rows have an actual value yet."
+
+    rows_html = "".join(body) or "<tr><td colspan='10' class='empty'>No logged predictions yet.</td></tr>"
+    page = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIRPRED predicted vs actual</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; margin: 24px; color: #1f2937; background: #f9fafb; }}
+  h1 {{ font-size: 18px; margin: 0 0 4px; }}
+  p {{ font-size: 12px; color: #6b7280; margin: 2px 0 10px; }}
+  table {{ border-collapse: collapse; width: 100%; background: #fff; font-size: 12px; }}
+  th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid #e5e7eb; white-space: nowrap; }}
+  th {{ background: #f3f4f6; color: #4b5563; position: sticky; top: 0; }}
+  td.n, th.n {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  td.act {{ font-weight: 600; }}
+  td.src {{ color: #6b7280; }}
+  td.empty {{ text-align: center; color: #9ca3af; padding: 24px; }}
+  .sum {{ font-weight: 600; color: #374151; }}
+</style></head><body>
+<h1>Predicted vs. actual PM2.5 ({escape(source)} rows)</h1>
+<p>Predicted = each variant's 24-hour mean forecast. Actual = mean of the real hourly readings over the same 24 hours
+(hover a value for its source). Times are Philippine time. Rows marked "backfilled hindcast" are retrospective tests;
+all others were logged live. All values in &micro;g/m&sup3;; Error = actual &minus; C.</p>
+<p class="sum">{summary}</p>
+<table>
+<thead><tr><th>Predicted at</th><th>City</th><th>Source</th><th class="n">A</th><th class="n">B</th><th class="n">C (AIRPRED)</th><th class="n">D</th><th class="n">Actual</th><th class="n">Error (C)</th></tr></thead>
+<tbody>{rows_html}</tbody>
+</table>
+</body></html>"""
+    return HTMLResponse(page)
 
 
 @app.get("/predict")
@@ -199,7 +302,7 @@ def predict_live_geoscf(city: str):
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    #x_pm25_raw = x_pm25_raw * 2.0 (multiplier for testing)
+    x_pm25_raw = x_pm25_raw * 2.0
 
     x_pm25_scaled, x_met_scaled = scale_window_geoscf(x_pm25_raw, x_met_raw, SCALER)
 
@@ -245,20 +348,23 @@ def predict_live_openaq(city: str):
 
     results = {}
     with torch.no_grad():
-        for name, model in MODELS.items():
+        for name, model in MODELS_OPENAQ.items():
             y_hat = model(x_pm25, x_met)
             y_hat_real = inverse_pm25(y_hat.numpy()[0])
             results[name] = {"predicted": [round(float(v), 2) for v in y_hat_real]}
 
-    log_prediction(city, "OpenAQ (ground sensor)", n_hours, results)
+    log_prediction(city, OPENAQ_SOURCE_LABEL, n_hours, results)
 
     return {
         "city": city,
         "computed_live": True,
-        "data_source": "OpenAQ (ground sensor)",
+        "data_source": OPENAQ_SOURCE_LABEL,
+        "model_version": OPENAQ_MODEL_VERSION,
         "input_hours_used": n_hours,
         "note": f"PM2.5 input from a real OpenAQ ground sensor (not a model "
-                f"estimate); this run used {n_hours}h of context.",
+                f"estimate); this run used {n_hours}h of context. "
+                + ("Models fine-tuned on OpenAQ data." if _ALL_FT
+                   else "Using original MERRA-2-trained models (fine-tuned checkpoints not all found)."),
         "warnings": warnings,
         "variants": results,
     }
