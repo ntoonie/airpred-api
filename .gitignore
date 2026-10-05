@@ -1,0 +1,95 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# =========================
+# Environment / Secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Jupyter Notebook
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# VS Code
+# =========================
+.vscode/
+!.vscode/settings.json
+
+# =========================
+# Node.js / Next.js
+# =========================
+node_modules/
+.next/
+out/
+dist/
+.npm/
+*.tsbuildinfo
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# =========================
+# ML / Data
+# =========================
+data/raw/
+data/processed/
+data/final/
+
+# Large model files
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+*.keras
+*.safetensors
+
+# Large datasets
+*.npz
+*.npy
+*.parquet
+*.pkl
+
+# =========================
+# Streamlit
+# =========================
+.streamlit/secrets.toml
