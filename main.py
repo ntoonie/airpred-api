@@ -81,19 +81,29 @@ print("Models loaded:", list(MODELS.keys()))
 MODELS_OPENAQ = {}
 OPENAQ_MODEL_VERSION = {}
 for _name in VARIANT_CLASSES:
-    _ft_path = f"checkpoints/variant_{_name.lower()}_seed42_openaq_ft.pt"
+    # Prefer a regularised fine-tune (..._openaq_ft_reg.pt) if present, else the plain one.
+    _reg = f"checkpoints/variant_{_name.lower()}_seed42_openaq_ft_reg.pt"
+    _plain = f"checkpoints/variant_{_name.lower()}_seed42_openaq_ft.pt"
+    _ft_path = _reg if os.path.isfile(_reg) else _plain
     if os.path.isfile(_ft_path):
         _m = build_model(_name)
         _m.load_state_dict(torch.load(_ft_path, map_location=DEVICE))
         _m.eval()
         MODELS_OPENAQ[_name] = _m
-        OPENAQ_MODEL_VERSION[_name] = "fine-tuned on OpenAQ"
+        OPENAQ_MODEL_VERSION[_name] = ("fine-tuned on OpenAQ (regularised)" if _ft_path == _reg
+                                       else "fine-tuned on OpenAQ")
     else:
         MODELS_OPENAQ[_name] = MODELS[_name]
         OPENAQ_MODEL_VERSION[_name] = "original (MERRA-2 only; no fine-tuned checkpoint found)"
 print("OpenAQ-endpoint models:", OPENAQ_MODEL_VERSION)
-_ALL_FT = all(v == "fine-tuned on OpenAQ" for v in OPENAQ_MODEL_VERSION.values())
-OPENAQ_SOURCE_LABEL = "OpenAQ (ground sensor) [fine-tuned]" if _ALL_FT else "OpenAQ (ground sensor)"
+_ALL_FT = all(v.startswith("fine-tuned") for v in OPENAQ_MODEL_VERSION.values())
+_REG = sorted(k for k, v in OPENAQ_MODEL_VERSION.items() if "regularised" in v)
+if not _ALL_FT:
+    OPENAQ_SOURCE_LABEL = "OpenAQ (ground sensor)"
+elif _REG:
+    OPENAQ_SOURCE_LABEL = f"OpenAQ (ground sensor) [fine-tuned, {'+'.join(_REG)} regularised]"
+else:
+    OPENAQ_SOURCE_LABEL = "OpenAQ (ground sensor) [fine-tuned]"
 
 print("Loading scaler...")
 SCALER = joblib.load("scaler.pkl")

@@ -56,7 +56,6 @@ from live_data_openaq import (  # noqa: E402
 )
 
 SOURCE_LABEL = "OpenAQ (ground sensor) [backfilled hindcast]"
-SOURCE_LABEL_FT = "OpenAQ (ground sensor) [fine-tuned] [backfilled hindcast]"
 INPUT_HOURS = 48
 HORIZON_HOURS = 24
 
@@ -97,7 +96,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="report only, write nothing")
     args = parser.parse_args()
 
-    label = SOURCE_LABEL_FT if args.finetuned else SOURCE_LABEL
+    label = f"{app_main.OPENAQ_SOURCE_LABEL} [backfilled hindcast]" if args.finetuned else SOURCE_LABEL
     models = app_main.MODELS_OPENAQ if args.finetuned else app_main.MODELS
     if args.finetuned and any("fine-tuned" not in v for v in app_main.OPENAQ_MODEL_VERSION.values()):
         raise SystemExit("Not all fine-tuned checkpoints were found in checkpoints/ -- copy the four *_openaq_ft.pt files first.")
