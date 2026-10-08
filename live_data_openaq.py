@@ -42,6 +42,8 @@ USAGE (from main.py):
 from __future__ import annotations
 
 import os
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -110,6 +112,30 @@ def _require_api_key() -> str:
     return OPENAQ_API_KEY
 
 
+# OpenAQ allows only ~60 requests/minute. The map asks for all 10 cities at once, so:
+#  * the nearby-station list (which almost never changes) is cached for 6 hours,
+#  * every OpenAQ call retries briefly on HTTP 429, and
+#  * a rate limit that persists becomes a RuntimeError (HTTP 503), not a 500 crash.
+_CANDIDATE_TTL_S = 6 * 3600
+_CANDIDATE_CACHE: dict[str, tuple[float, list]] = {}
+_OPENAQ_LOCK = threading.Lock()   # one OpenAQ lookup at a time -> no bursts
+
+
+def _openaq_call(fn):
+    for wait in (3, 8, None):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            if type(e).__name__ != "HTTPRateLimitError":
+                raise
+            if wait is None:
+                raise RuntimeError(
+                    "OpenAQ rate limit reached (too many requests). Wait a minute and retry; "
+                    "results are cached for 10 minutes once fetched."
+                ) from e
+            time.sleep(wait)
+
+
 def _find_pm25_candidates(city: str) -> list[tuple[int, int, str, float | None]]:
     """Returns up to CANDIDATE_SEARCH_LIMIT (location_id, sensor_id, name,
     distance_m) tuples with a pm25 sensor within SEARCH_RADIUS_M of the
@@ -127,13 +153,17 @@ def _find_pm25_candidates(city: str) -> list[tuple[int, int, str, float | None]]
     lat, lon = CITY_COORDS[city]
     api_key = _require_api_key()
 
+    hit = _CANDIDATE_CACHE.get(city)
+    if hit and time.time() - hit[0] < _CANDIDATE_TTL_S:
+        return list(hit[1])
+
     with OpenAQ(api_key=api_key) as client:
-        resp = client.locations.list(
+        resp = _openaq_call(lambda: client.locations.list(
             coordinates=(lat, lon),
             radius=SEARCH_RADIUS_M,
             parameters_id=PM25_PARAMETER_ID,
             limit=CANDIDATE_SEARCH_LIMIT,
-        )
+        ))
 
     results = getattr(resp, "results", None) or []
     if not results:
@@ -162,6 +192,7 @@ def _find_pm25_candidates(city: str) -> list[tuple[int, int, str, float | None]]
             f"{len(results)} OpenAQ location(s) found near {city}, but none "
             "actually carry a pm25 sensor -- inspect manually."
         )
+    _CANDIDATE_CACHE[city] = (time.time(), list(candidates))
     return candidates
 
 
@@ -235,13 +266,13 @@ def fetch_live_window_openaq(city: str) -> tuple[np.ndarray, np.ndarray, int, li
     extra_tries = 0
     with OpenAQ(api_key=api_key) as client:
         for _, cand_sensor_id, cand_name, cand_dist in candidates:
-            resp = client.measurements.list(
+            resp = _openaq_call(lambda: client.measurements.list(
                 sensors_id=cand_sensor_id,
                 data="hours",
                 datetime_from=start,
                 datetime_to=now,
                 limit=TARGET_HOURS + 2,
-            )
+            ))
             cand_records = getattr(resp, "results", None) or []
             tried.append(f"{cand_name} ({len(cand_records)} hourly rows)")
             # Keep the candidate with the most hourly rows seen so far.

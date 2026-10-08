@@ -44,7 +44,7 @@ load_dotenv()
 from openaq import OpenAQ  # noqa: E402
 
 import main as app_main  # noqa: E402  (loads the trained models + scaler; does not start the server)
-from fill_actuals import _retry, fetch_sensor_series  # noqa: E402
+from fill_actuals import _retry, fetch_sensor_series, hour24_reading  # noqa: E402
 from live_data_openaq import (  # noqa: E402
     CITY_COORDS,
     MET_URL,
@@ -91,6 +91,8 @@ def main():
     parser.add_argument("--anchor-hour-utc", type=int, default=0, help="UTC hour of each daily anchor (default 0 = 08:00 PHT)")
     parser.add_argument("--min-input-hours", type=int, default=24, help="min real readings in the 48h input window (default 24)")
     parser.add_argument("--min-actual-hours", type=int, default=18, help="min real readings in the 24h actual window (default 18)")
+    parser.add_argument("--tolerance-hours", type=int, default=1,
+                        help="if the exact 24th-hour reading is missing, accept the nearest one within this many hours (default 1; 0 = exact only)")
     parser.add_argument("--finetuned", action="store_true",
                         help="use the OpenAQ-fine-tuned checkpoints (main.MODELS_OPENAQ) and label rows accordingly")
     parser.add_argument("--dry-run", action="store_true", help="report only, write nothing")
@@ -182,9 +184,14 @@ def main():
                         y = model(xp_t, xm_t)
                         results[vname] = [round(float(v), 2) for v in app_main.inverse_pm25(y.numpy()[0])]
 
-                actual = round(float(act_win.mean()), 2)
-                source = (f"OpenAQ '{name}' ({dist_str}), mean of {len(act_win)} hourly readings "
-                          f"{anchor:%Y-%m-%d %H:%M}-{anchor + timedelta(hours=HORIZON_HOURS):%Y-%m-%d %H:%M} UTC")
+                end = anchor + timedelta(hours=HORIZON_HOURS)
+                h24 = hour24_reading(act_win, end, args.tolerance_hours)
+                if h24 is None:
+                    print(f"  {anchor:%m-%d %H:%M}: no hour-24 reading within {args.tolerance_hours}h -- skipped")
+                    continue
+                actual, h24_ts = round(h24[0], 2), h24[1]
+                source = (f"OpenAQ '{name}' ({dist_str}), hour-24 reading at {h24_ts:%Y-%m-%d %H:%M} UTC "
+                          f"(forecast window {anchor:%Y-%m-%d %H:%M}-{end:%Y-%m-%d %H:%M} UTC)")
                 new_rows.append({
                     "logged_at_utc": anchor.isoformat(),
                     "city": city,
@@ -198,17 +205,16 @@ def main():
                     "actual_source": source,
                     "actual_logged_at": datetime.now(timezone.utc).isoformat(),
                 })
-                c_mean = sum(results["C"]) / len(results["C"])
-                print(f"  {anchor:%m-%d %H:%M}: predicted(C) {c_mean:.1f}  actual {actual:.1f}  ({n_real}h input)")
+                print(f"  {anchor:%m-%d %H:%M}: predicted(C, hour 24) {results['C'][-1]:.1f}  actual(hour 24) {actual:.1f}  ({n_real}h input)")
 
     if not new_rows:
         print("\nNothing to add.")
         return
 
-    print("\nMean absolute error of the 24h-mean forecast vs actual, across new rows:")
+    print("\nMean absolute error of the hour-24 forecast vs the hour-24 reading, across new rows:")
     for v, col in zip("ABCD", ["variant_a_predicted_24h", "variant_b_predicted_24h",
                                "variant_c_predicted_24h", "variant_d_predicted_24h"]):
-        errs = [abs(r["actual_pm25"] - np.mean(json.loads(r[col]))) for r in new_rows]
+        errs = [abs(r["actual_pm25"] - json.loads(r[col])[-1]) for r in new_rows]
         print(f"  Variant {v}: {np.mean(errs):.2f} µg/m³  (n={len(errs)})")
 
     if args.dry_run:

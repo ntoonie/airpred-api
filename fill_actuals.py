@@ -3,8 +3,9 @@
 For each logged prediction whose 24-hour forecast window has fully elapsed
 and whose actual value is still blank, this fetches the real hourly PM2.5
 readings from the nearest live OpenAQ station for that city over exactly the
-24 hours the model predicted, takes their mean, and writes it into the row
-(with the station name, distance and hour count recorded in actual_source).
+24 hours the model predicted, and writes the reading for the forecast's 24th hour (the last hour of that window)
+into the row, with the station name, distance and exact hour recorded in
+actual_source. This matches the dashboard, which shows the 24th-hour forecast.
 
 The window is the 24 whole hours starting at the next full hour after the
 prediction was logged -- the same hours the model forecast. A row is only
@@ -64,6 +65,21 @@ def window_for(logged_at: datetime) -> tuple[datetime, datetime]:
     return start, start + timedelta(hours=WINDOW_HOURS)
 
 
+def hour24_reading(window: pd.Series, end, tolerance_h: int):
+    """The sensor reading for the forecast's 24th hour, i.e. the hour starting at
+    end - 1h (the last hour of the 24-hour window). Uses the exact hour when
+    present, else the nearest reading within +/- tolerance_h hours. Returns
+    (value, timestamp) or None."""
+    target = pd.Timestamp(end) - pd.Timedelta(hours=1)
+    if len(window) == 0:
+        return None
+    gaps = abs(window.index - target)          # TimedeltaIndex
+    pos = int(gaps.argmin())
+    if gaps[pos] > pd.Timedelta(hours=tolerance_h):
+        return None
+    return float(window.iloc[pos]), window.index[pos]
+
+
 def fetch_sensor_series(client, sensor_id: int, start: datetime, end: datetime) -> pd.Series:
     resp = _retry(
         client.measurements.list,
@@ -86,6 +102,8 @@ def fetch_sensor_series(client, sensor_id: int, start: datetime, end: datetime) 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--tolerance-hours", type=int, default=1,
+                        help="if the exact 24th-hour reading is missing, accept the nearest one within this many hours (default 1; 0 = exact only)")
     parser.add_argument("--min-hours", type=int, default=18,
                         help="minimum hourly readings required in the window (default 18 of 24)")
     parser.add_argument("--dry-run", action="store_true", help="report only, do not write the CSV")
@@ -144,7 +162,7 @@ def main():
                 for _, sensor_id, name, dist in candidates:
                     s = series_for(sensor_id)
                     window = s[(s.index >= pd.Timestamp(start)) & (s.index < pd.Timestamp(end))]
-                    if len(window) >= args.min_hours:
+                    if len(window) >= args.min_hours and hour24_reading(window, end, args.tolerance_hours) is not None:
                         chosen = (name, dist, window)
                         break
                 label = f"{row['logged_at_utc'][:16]}"
@@ -153,13 +171,14 @@ def main():
                     skipped += 1
                     continue
                 name, dist, window = chosen
-                mean = round(float(window.mean()), 2)
+                value, ts = hour24_reading(window, end, args.tolerance_hours)
+                value = round(value, 2)
                 dist_str = f"{dist:.0f}m" if dist is not None else "distance unknown"
-                source = (f"OpenAQ '{name}' ({dist_str}), mean of {len(window)} hourly readings "
-                          f"{start:%Y-%m-%d %H:%M}-{end:%Y-%m-%d %H:%M} UTC")
-                print(f"  {label}: actual {mean} µg/m³  <- {name}, {len(window)}h")
+                source = (f"OpenAQ '{name}' ({dist_str}), hour-24 reading at {ts:%Y-%m-%d %H:%M} UTC "
+                          f"(forecast window {start:%Y-%m-%d %H:%M}-{end:%Y-%m-%d %H:%M} UTC)")
+                print(f"  {label}: actual {value} µg/m³ (hour 24 @ {ts:%m-%d %H:%M})  <- {name}")
                 if not args.dry_run:
-                    row["actual_pm25"] = mean
+                    row["actual_pm25"] = value
                     row["actual_source"] = source
                     row["actual_logged_at"] = datetime.now(timezone.utc).isoformat()
                 filled += 1

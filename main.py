@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 import os
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from html import escape
 
@@ -183,7 +185,7 @@ def prediction_log(limit: int = 200, source: str | None = None):
     def summarize(raw: str):
         try:
             vals = json.loads(raw)
-            return {"mean": round(sum(vals) / len(vals), 2), "peak": round(max(vals), 2)}
+            return {"mean": round(sum(vals) / len(vals), 2), "peak": round(max(vals), 2), "last": round(vals[-1], 2)}
         except (ValueError, TypeError, ZeroDivisionError):
             return None
 
@@ -341,11 +343,29 @@ def predict_live_geoscf(city: str):
     }
 
 
+# Result cache for /predict_live_openaq: the map and pages call this repeatedly, and OpenAQ
+# rate-limits (~60 requests/minute). Within the TTL a city is served from memory, which also
+# means repeat views are not written to prediction_log.csv again.
+OPENAQ_CACHE_TTL_S = 600
+_OPENAQ_RESULT_CACHE: dict = {}
+_OPENAQ_FETCH_LOCK = threading.Lock()
+
+
 @app.get("/predict_live_openaq")
 def predict_live_openaq(city: str):
     if city not in CITY_INPUTS:
         raise HTTPException(status_code=404, detail=f"Unknown city: {city}")
 
+    with _OPENAQ_FETCH_LOCK:  # one OpenAQ fetch at a time; waiting requests then hit the cache
+        hit = _OPENAQ_RESULT_CACHE.get(city)
+        if hit and time.time() - hit[0] < OPENAQ_CACHE_TTL_S:
+            return hit[1]
+        payload = _predict_live_openaq_uncached(city)
+        _OPENAQ_RESULT_CACHE[city] = (time.time(), payload)
+        return payload
+
+
+def _predict_live_openaq_uncached(city: str):
     try:
         x_pm25_raw, x_met_raw, n_hours, warnings = fetch_live_window_openaq(city)
     except RuntimeError as e:
