@@ -75,7 +75,9 @@ def fetch_sensor_series(client, sensor_id: int, start: datetime, end: datetime) 
     )
     records = getattr(resp, "results", None) or []
     if not records:
-        return pd.Series(dtype="float64")
+        # Empty series must still have a (tz-aware) DatetimeIndex: newer pandas gives an empty
+        # Series a RangeIndex, and comparing that with a Timestamp raises TypeError.
+        return pd.Series(dtype="float64", index=pd.DatetimeIndex([], tz="UTC"))
     times = [pd.Timestamp(r.period.datetime_from.utc) for r in records]
     values = [r.value for r in records]
     s = pd.Series(values, index=pd.DatetimeIndex(times)).sort_index()

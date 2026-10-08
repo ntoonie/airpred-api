@@ -1,15 +1,17 @@
 """Builds a live AIRPRED input window using REAL ground-sensor PM2.5 readings
 from OpenAQ (openaq.org), instead of GEOS-CF's modeled estimate.
 
-WHY THIS MIGHT BE BETTER THAN GEOS-CF FOR THE PM2.5 FEATURE SPECIFICALLY:
-    AIRPRED's training data's "pm25" input feature came from real ground
-    station readings, not a model estimate -- GEOS-CF was only chosen
-    because, at the time, no accessible raw (non-AQI) live ground source was
-    found. OpenAQ aggregates real low-cost/reference sensors (here: a
-    Clarity optical sensor at "Anda Circle", Manila) that report PM2.5 in
-    µg/m³ directly, which is a closer conceptual match to what the model
-    actually trained on. Open-Meteo still supplies meteorology, same as the
-    GEOS-CF pipeline -- only the PM2.5 source changes here.
+WHY USE OPENAQ:
+    It gives real, measured PM2.5 in µg/m³ at point locations, so it can serve
+    as ground truth for checking predictions. Open-Meteo still supplies
+    meteorology, same as the GEOS-CF pipeline -- only the PM2.5 source changes.
+
+    CAVEAT (corrected): AIRPRED's TRAINING PM2.5 was MERRA-2-derived (coarse
+    ~50 km grid; one cell covers all 10 NCR cities), NOT ground-station data.
+    Point sensors in urban Manila read much higher than that grid-cell mean,
+    so feeding OpenAQ values into the model is a train/inference distribution
+    shift, and the forecasts come out systematically low vs. OpenAQ actuals.
+    Disclose this; do not present OpenAQ-input forecasts as in-distribution.
 
 STILL BE HONEST ABOUT:
   - These are mostly low-cost optical sensors (Clarity, sensor.community,
@@ -50,6 +52,8 @@ from openaq import OpenAQ
 OPENAQ_API_KEY = os.environ.get("OPENAQ_API_KEY")
 PM25_PARAMETER_ID = 2          # OpenAQ's fixed id for the pm25 parameter
 SEARCH_RADIUS_M = 25_000       # OpenAQ's maximum allowed radius
+MIN_HOURS_PREFERRED = 24       # a station with at least this many hourly rows is accepted immediately
+MAX_EXTRA_STATIONS = 6         # once some data is found, try at most this many more candidates for a fuller window
 TARGET_HOURS = 48              # how far back we TRY to pull; fewer is fine (length-agnostic model)
 
 MET_URL = "https://api.open-meteo.com/v1/forecast"
@@ -219,11 +223,16 @@ def fetch_live_window_openaq(city: str) -> tuple[np.ndarray, np.ndarray, int, li
     candidates: list[tuple[int, int, str, float | None]] = []
     if city in _STATION_CACHE:
         candidates.append(_STATION_CACHE[city])
-    candidates += [c for c in _find_pm25_candidates(city) if c not in candidates]
+    seen_sensors = {c[1] for c in candidates}
+    for c in _find_pm25_candidates(city):
+        if c[1] not in seen_sensors:
+            candidates.append(c)
+            seen_sensors.add(c[1])
 
     records = []
     station_name = distance_m = sensor_id = None
     tried: list[str] = []
+    extra_tries = 0
     with OpenAQ(api_key=api_key) as client:
         for _, cand_sensor_id, cand_name, cand_dist in candidates:
             resp = client.measurements.list(
@@ -235,9 +244,18 @@ def fetch_live_window_openaq(city: str) -> tuple[np.ndarray, np.ndarray, int, li
             )
             cand_records = getattr(resp, "results", None) or []
             tried.append(f"{cand_name} ({len(cand_records)} hourly rows)")
-            if cand_records:
+            # Keep the candidate with the most hourly rows seen so far.
+            if len(cand_records) > len(records):
                 records, sensor_id, station_name, distance_m = cand_records, cand_sensor_id, cand_name, cand_dist
+            # Stop as soon as a station gives a reasonably full window.
+            if len(records) >= MIN_HOURS_PREFERRED:
                 break
+            # A station returned something but is thin: look a few candidates
+            # further for a fuller one, then settle for the best seen.
+            if records:
+                extra_tries += 1
+                if extra_tries > MAX_EXTRA_STATIONS:
+                    break
 
     if not records:
         _STATION_CACHE.pop(city, None)
@@ -268,8 +286,8 @@ def fetch_live_window_openaq(city: str) -> tuple[np.ndarray, np.ndarray, int, li
     )
     if len(tried) > 1:
         warnings.append(
-            f"{len(tried) - 1} nearer OpenAQ station(s) were tried first and "
-            f"skipped for having no hourly data: {'; '.join(tried[:-1])}."
+            f"{len(tried)} OpenAQ station(s) were tried (nearest first); the one "
+            f"with the most hourly data was used: {'; '.join(tried)}."
         )
     warnings.append(
         f"Using {n_hours} real hour(s) of OpenAQ PM2.5 context out of "
